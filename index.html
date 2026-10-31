@@ -1,0 +1,542 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>音響モニター</title>
+
+<style>
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  padding: 18px;
+  background: #10151d;
+  color: #edf2f7;
+  font-family: system-ui, sans-serif;
+}
+
+main {
+  max-width: 850px;
+  margin: auto;
+}
+
+h1 {
+  font-size: 1.45rem;
+}
+
+.panel {
+  background: #1b2430;
+  border: 1px solid #344253;
+  border-radius: 14px;
+  padding: 16px;
+  margin: 12px 0;
+}
+
+button {
+  border: none;
+  border-radius: 10px;
+  padding: 12px 18px;
+  font-weight: bold;
+  background: #55c2a5;
+  color: #071a16;
+  margin: 4px;
+}
+
+button:disabled {
+  opacity: 0.45;
+}
+
+.secondary {
+  background: #35465a;
+  color: white;
+}
+
+.status {
+  color: #a9b9ca;
+}
+
+.metrics {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.metric {
+  flex: 1;
+  min-width: 130px;
+  background: #111923;
+  padding: 12px;
+  border-radius: 10px;
+}
+
+.value {
+  font-size: 1.5rem;
+  font-weight: bold;
+  font-variant-numeric: tabular-nums;
+}
+
+canvas {
+  width: 100%;
+  height: 330px;
+  display: block;
+  background: #0d131b;
+  border-radius: 10px;
+}
+
+small {
+  color: #a9b9ca;
+}
+</style>
+</head>
+
+<body>
+
+<main>
+
+<h1>音響モニター</h1>
+
+<div class="panel">
+
+<p>
+スマートフォンのマイク音声から、
+50〜2000 Hzの基本周波数を推定します。
+</p>
+
+<button id="start">マイク開始</button>
+<button id="stop" class="secondary" disabled>停止</button>
+<button id="csv" class="secondary">CSV保存</button>
+
+<p id="status" class="status">
+開始を押すとマイク使用の許可を求めます。
+</p>
+
+<div class="metrics">
+
+<div class="metric">
+<small>基本周波数</small>
+<div class="value" id="freq">— Hz</div>
+</div>
+
+<div class="metric">
+<small>推定信頼度</small>
+<div class="value" id="confidence">—</div>
+</div>
+
+<div class="metric">
+<small>検出回数</small>
+<div class="value" id="count">0</div>
+</div>
+
+</div>
+</div>
+
+<div class="panel">
+
+<canvas id="plot" width="1000" height="420"></canvas>
+
+<small>
+横軸：直近15秒 ／ 縦軸：基本周波数（50〜2000 Hz）
+</small>
+
+</div>
+
+<p>
+<small>
+※ 推定値は音の種類・雑音・反響などにより変動します。
+マイクを使うにはHTTPS接続が必要です。
+</small>
+</p>
+
+</main>
+
+<script>
+
+const $ = id => document.getElementById(id);
+
+const canvas = $("plot");
+const ctx = canvas.getContext("2d");
+
+let audioCtx;
+let stream;
+let source;
+let analyser;
+let data;
+let raf = null;
+
+let history = [];
+let count = 0;
+let lastSample = 0;
+
+const minHz = 50;
+const maxHz = 2000;
+const windowSec = 15;
+
+
+// 基本周波数推定（YIN方式）
+function yin(buf, sr) {
+
+  const n = buf.length;
+  const half = Math.floor(n / 2);
+
+  const diff = new Float32Array(half);
+
+  for (let tau = 1; tau < half; tau++) {
+
+    let sum = 0;
+
+    for (let i = 0; i < half; i++) {
+
+      const d = buf[i] - buf[i + tau];
+      sum += d * d;
+
+    }
+
+    diff[tau] = sum;
+
+  }
+
+  const cmnd = new Float32Array(half);
+
+  cmnd[0] = 1;
+
+  let running = 0;
+
+  for (let tau = 1; tau < half; tau++) {
+
+    running += diff[tau];
+
+    cmnd[tau] =
+      diff[tau] * tau / (running || 1);
+
+  }
+
+  let tau = -1;
+  const threshold = 0.15;
+
+  for (let t = 2; t < half; t++) {
+
+    if (cmnd[t] < threshold) {
+
+      while (
+        t + 1 < half &&
+        cmnd[t + 1] < cmnd[t]
+      ) {
+        t++;
+      }
+
+      tau = t;
+      break;
+
+    }
+
+  }
+
+  if (tau < 0) return null;
+
+  let better = tau;
+
+  if (tau > 1 && tau < half - 1) {
+
+    const s0 = cmnd[tau - 1];
+    const s1 = cmnd[tau];
+    const s2 = cmnd[tau + 1];
+
+    const denom = 2 * (2 * s1 - s2 - s0);
+
+    if (denom) {
+      better = tau + (s2 - s0) / denom;
+    }
+
+  }
+
+  const hz = sr / better;
+  const confidence = 1 - cmnd[tau];
+
+  if (
+    hz < minHz ||
+    hz > maxHz ||
+    confidence < 0.55
+  ) {
+    return null;
+  }
+
+  return {
+    hz,
+    confidence
+  };
+
+}
+
+
+// グラフ描画
+function draw(now) {
+
+  const w = canvas.width;
+  const h = canvas.height;
+
+  ctx.clearRect(0, 0, w, h);
+
+  ctx.fillStyle = "#0d131b";
+  ctx.fillRect(0, 0, w, h);
+
+  ctx.font = "14px system-ui";
+  ctx.strokeStyle = "#293747";
+  ctx.fillStyle = "#a9b9ca";
+  ctx.lineWidth = 1;
+
+  // 横線と周波数目盛り
+  for (let i = 0; i <= 4; i++) {
+
+    const y = 20 + (h - 50) * i / 4;
+
+    ctx.beginPath();
+    ctx.moveTo(55, y);
+    ctx.lineTo(w - 12, y);
+    ctx.stroke();
+
+    const v = Math.round(
+      maxHz - (maxHz - minHz) * i / 4
+    );
+
+    ctx.fillText(v + " Hz", 5, y + 5);
+
+  }
+
+  // 時間目盛り
+  for (let i = 0; i <= 5; i++) {
+
+    const x = 55 + (w - 67) * i / 5;
+
+    ctx.beginPath();
+    ctx.moveTo(x, 20);
+    ctx.lineTo(x, h - 30);
+    ctx.stroke();
+
+    ctx.fillText(
+      (i * 3) + "s",
+      x - 10,
+      h - 8
+    );
+
+  }
+
+  const cutoff = now - windowSec;
+
+  history = history.filter(
+    p => p.t >= cutoff
+  );
+
+  // 周波数の線
+  ctx.strokeStyle = "#55c2a5";
+  ctx.lineWidth = 3;
+  ctx.beginPath();
+
+  let started = false;
+
+  for (const p of history) {
+
+    const x =
+      55 + (w - 67) *
+      (p.t - cutoff) / windowSec;
+
+    const y =
+      20 + (h - 50) *
+      (maxHz - p.hz) / (maxHz - minHz);
+
+    if (!started) {
+      ctx.moveTo(x, y);
+      started = true;
+    } else {
+      ctx.lineTo(x, y);
+    }
+
+  }
+
+  ctx.stroke();
+
+}
+
+
+// リアルタイム解析
+function tick() {
+
+  if (!analyser) return;
+
+  analyser.getFloatTimeDomainData(data);
+
+  const now = performance.now() / 1000;
+
+  if (now - lastSample > 0.12) {
+
+    lastSample = now;
+
+    const result = yin(
+      data,
+      audioCtx.sampleRate
+    );
+
+    if (result) {
+
+      history.push({
+        t: now,
+        hz: result.hz
+      });
+
+      count++;
+
+      $("freq").textContent =
+        result.hz.toFixed(1) + " Hz";
+
+      $("confidence").textContent =
+        Math.round(result.confidence * 100) + "%";
+
+      $("count").textContent = count;
+
+    } else {
+
+      $("freq").textContent = "— Hz";
+
+    }
+
+  }
+
+  draw(now);
+
+  raf = requestAnimationFrame(tick);
+
+}
+
+
+// マイク開始
+$("start").onclick = async () => {
+
+  try {
+
+    stream = await navigator.mediaDevices.getUserMedia({
+
+      audio: {
+        echoCancellation: false,
+        noiseSuppression: false,
+        autoGainControl: false
+      }
+
+    });
+
+    audioCtx = new (
+      window.AudioContext ||
+      window.webkitAudioContext
+    )();
+
+    source =
+      audioCtx.createMediaStreamSource(stream);
+
+    analyser =
+      audioCtx.createAnalyser();
+
+    analyser.fftSize = 4096;
+
+    data = new Float32Array(
+      analyser.fftSize
+    );
+
+    source.connect(analyser);
+
+    $("status").textContent =
+      "マイク入力中です。";
+
+    $("start").disabled = true;
+    $("stop").disabled = false;
+
+    tick();
+
+  } catch (e) {
+
+    $("status").textContent =
+      "マイクを開始できません：" + e.message;
+
+  }
+
+};
+
+
+// 停止
+$("stop").onclick = () => {
+
+  if (raf) {
+    cancelAnimationFrame(raf);
+  }
+
+  raf = null;
+
+  if (stream) {
+    stream.getTracks().forEach(
+      t => t.stop()
+    );
+  }
+
+  if (audioCtx) {
+    audioCtx.close();
+  }
+
+  analyser = null;
+
+  $("start").disabled = false;
+  $("stop").disabled = true;
+
+  $("status").textContent = "停止しました。";
+
+};
+
+
+// CSV保存
+$("csv").onclick = () => {
+
+  const rows = [
+    "elapsed_seconds,frequency_hz"
+  ];
+
+  if (history.length) {
+
+    const origin = history[0].t;
+
+    history.forEach(p => {
+
+      rows.push(
+        (p.t - origin).toFixed(3) +
+        "," +
+        p.hz.toFixed(2)
+      );
+
+    });
+
+  }
+
+  const blob = new Blob(
+    ["\ufeff" + rows.join("\n")],
+    {
+      type: "text/csv;charset=utf-8"
+    }
+  );
+
+  const a = document.createElement("a");
+
+  a.href = URL.createObjectURL(blob);
+  a.download = "frequency-log.csv";
+
+  a.click();
+
+  URL.revokeObjectURL(a.href);
+
+};
+
+
+// 初期グラフ
+draw(0);
+
+</script>
+
+</body>
+</html>
