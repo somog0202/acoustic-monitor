@@ -90,15 +90,7 @@ button:disabled {
   font-size: 1rem;
 }
 
-.metrics {
-  display: flex;
-  gap: 12px;
-  flex-wrap: wrap;
-}
-
 .metric {
-  flex: 1;
-  min-width: 130px;
   background: #111923;
   padding: 12px;
   border-radius: 10px;
@@ -117,7 +109,6 @@ canvas {
   background: #0d131b;
   border-radius: 10px;
 }
-
 </style>
 </head>
 
@@ -129,43 +120,40 @@ canvas {
 
 <div class="panel">
 
-<div class="range-controls">
+  <div class="range-controls">
 
-  <div class="range-field">
-    <label for="minInput">下限周波数 (Hz)</label>
-    <input
-      type="number"
-      id="minInput"
-      value="1800"
-      min="20"
-      max="10000"
-      step="10"
-    >
+    <div class="range-field">
+      <label for="minInput">下限周波数 (Hz)</label>
+      <input
+        type="number"
+        id="minInput"
+        value="1800"
+        min="20"
+        max="10000"
+        step="10"
+      >
+    </div>
+
+    <div class="range-field">
+      <label for="maxInput">上限周波数 (Hz)</label>
+      <input
+        type="number"
+        id="maxInput"
+        value="2200"
+        min="20"
+        max="10000"
+        step="10"
+      >
+    </div>
+
+    <button id="applyRange">範囲を適用</button>
+
   </div>
 
-  <div class="range-field">
-    <label for="maxInput">上限周波数 (Hz)</label>
-    <input
-      type="number"
-      id="maxInput"
-      value="2200"
-      min="20"
-      max="10000"
-      step="10"
-    >
-  </div>
+  <button id="start">マイク開始</button>
+  <button id="stop" class="secondary" disabled>停止</button>
 
-  <button id="applyRange">範囲を適用</button>
-
-</div>
-
-<button id="start">マイク開始</button>
-<button id="stop" class="secondary" disabled>停止</button>
-<button id="csv" class="secondary">CSV保存</button>
-
-<p id="status" class="status"></p>
-
-<div class="metrics">
+  <p id="status" class="status"></p>
 
   <div class="metric">
     <div>基本周波数</div>
@@ -174,12 +162,8 @@ canvas {
 
 </div>
 
-</div>
-
 <div class="panel">
-
-<canvas id="plot" width="1000" height="420"></canvas>
-
+  <canvas id="plot" width="1000" height="420"></canvas>
 </div>
 
 </main>
@@ -196,15 +180,37 @@ let stream;
 let source;
 let analyser;
 let data;
-let raf = null;
+
+let animationFrameId = null;
+let sampleTimerId = null;
 
 let history = [];
-let lastSample = 0;
+
+let lastDetectedAt = null;
+let gapAdded = false;
 
 let minHz = 1800;
 let maxHz = 2200;
 
-const windowSec = 15;
+
+// 推定・記録の間隔
+const SAMPLE_INTERVAL_MS = 20;
+
+// グラフのスクロール速度
+const SCROLL_SPEED = 2;
+
+// グラフの通常表示幅（15秒相当）
+const GRAPH_WINDOW_SEC = 15;
+
+// 実際に表示される時間幅
+const VISIBLE_SECONDS =
+  GRAPH_WINDOW_SEC / SCROLL_SPEED;
+
+// 1秒以上検出できなければグラフを切断
+const SILENCE_SECONDS = 1;
+
+// 無音判定の振幅しきい値
+const MIN_RMS = 0.003;
 
 
 // 周波数範囲の変更
@@ -231,8 +237,7 @@ $("applyRange").onclick = () => {
   minHz = newMin;
   maxHz = newMax;
 
-  $("status").textContent =
-    minHz + "〜" + maxHz + " Hz";
+  $("status").textContent = "";
 
   draw(performance.now() / 1000);
 
@@ -245,6 +250,20 @@ function yin(buf, sr) {
   const n = buf.length;
   const half = Math.floor(n / 2);
 
+  // 音量の確認
+  let energy = 0;
+
+  for (let i = 0; i < n; i++) {
+    energy += buf[i] * buf[i];
+  }
+
+  const rms = Math.sqrt(energy / n);
+
+  if (rms < MIN_RMS) {
+    return null;
+  }
+
+  // 周波数範囲から探索する周期の範囲を決定
   const minTau = Math.max(
     2,
     Math.ceil(sr / maxHz)
@@ -255,10 +274,13 @@ function yin(buf, sr) {
     Math.floor(sr / minHz)
   );
 
-  if (minTau > maxTau) return null;
+  if (minTau > maxTau) {
+    return null;
+  }
 
   const diff = new Float32Array(maxTau + 1);
 
+  // 差分関数
   for (let tau = 1; tau <= maxTau; tau++) {
 
     let sum = 0;
@@ -266,6 +288,7 @@ function yin(buf, sr) {
     for (let i = 0; i < half; i++) {
 
       const d = buf[i] - buf[i + tau];
+
       sum += d * d;
 
     }
@@ -274,6 +297,7 @@ function yin(buf, sr) {
 
   }
 
+  // 累積平均正規化差分関数
   const cmnd = new Float32Array(maxTau + 1);
 
   cmnd[0] = 1;
@@ -290,6 +314,7 @@ function yin(buf, sr) {
   }
 
   let tau = -1;
+
   const threshold = 0.15;
 
   for (let t = minTau; t <= maxTau; t++) {
@@ -304,14 +329,18 @@ function yin(buf, sr) {
       }
 
       tau = t;
+
       break;
 
     }
 
   }
 
-  if (tau < 0) return null;
+  if (tau < 0) {
+    return null;
+  }
 
+  // 補間による精度改善
   let better = tau;
 
   if (tau > 1 && tau < maxTau) {
@@ -329,6 +358,7 @@ function yin(buf, sr) {
   }
 
   const hz = sr / better;
+
   const confidence = 1 - cmnd[tau];
 
   if (
@@ -360,6 +390,8 @@ function draw(now) {
   ctx.fillStyle = "#a9b9ca";
   ctx.lineWidth = 1;
 
+  const cutoff = now - VISIBLE_SECONDS;
+
   // 周波数目盛り
   for (let i = 0; i <= 4; i++) {
 
@@ -388,34 +420,33 @@ function draw(now) {
     ctx.lineTo(x, h - 30);
     ctx.stroke();
 
+    const seconds =
+      (i * VISIBLE_SECONDS / 5).toFixed(1);
+
     ctx.fillText(
-      (i * 3) + "s",
+      seconds + "s",
       x - 10,
       h - 8
     );
 
   }
 
-  const cutoff = now - windowSec;
-
-  // 直近15秒のデータ
+  // 表示範囲内のデータ
   const visibleHistory = history.filter(
-    p =>
-      p.t >= cutoff &&
-      p.hz >= minHz &&
-      p.hz <= maxHz
+    p => p.t >= cutoff
   );
 
-  // グラフ領域内に描画
   ctx.save();
 
   ctx.beginPath();
+
   ctx.rect(
     65,
     20,
     w - 77,
     h - 50
   );
+
   ctx.clip();
 
   ctx.strokeStyle = "#55c2a5";
@@ -426,9 +457,18 @@ function draw(now) {
 
   for (const p of visibleHistory) {
 
+    // 切断マーカーがあれば線を途切れさせる
+    if (p.hz === null) {
+
+      started = false;
+
+      continue;
+
+    }
+
     const x =
       65 + (w - 77) *
-      (p.t - cutoff) / windowSec;
+      (p.t - cutoff) / VISIBLE_SECONDS;
 
     const y =
       20 + (h - 50) *
@@ -437,6 +477,7 @@ function draw(now) {
     if (!started) {
 
       ctx.moveTo(x, y);
+
       started = true;
 
     } else {
@@ -454,45 +495,95 @@ function draw(now) {
 }
 
 
-// リアルタイム解析
-function tick() {
+// 音声のサンプリングと周波数推定
+function sampleAudio() {
 
-  if (!analyser) return;
-
-  analyser.getFloatTimeDomainData(data);
+  if (!analyser) {
+    return;
+  }
 
   const now = performance.now() / 1000;
 
-  if (now - lastSample > 0.12) {
+  analyser.getFloatTimeDomainData(data);
 
-    lastSample = now;
+  const result = yin(
+    data,
+    audioCtx.sampleRate
+  );
 
-    const result = yin(
-      data,
-      audioCtx.sampleRate
-    );
+  if (result !== null) {
 
-    if (result !== null) {
+    // 1秒以上検出できていなければ切断マーカーを追加
+    if (
+      lastDetectedAt !== null &&
+      now - lastDetectedAt >= SILENCE_SECONDS &&
+      !gapAdded
+    ) {
 
       history.push({
-        t: now,
-        hz: result
+        t: lastDetectedAt + SILENCE_SECONDS,
+        hz: null
       });
 
-      $("freq").textContent =
-        result.toFixed(1) + " Hz";
+      gapAdded = true;
 
-    } else {
+    }
 
-      $("freq").textContent = "— Hz";
+    // 周波数データを追加
+    history.push({
+      t: now,
+      hz: result
+    });
+
+    lastDetectedAt = now;
+    gapAdded = false;
+
+    $("freq").textContent =
+      result.toFixed(1) + " Hz";
+
+  } else {
+
+    $("freq").textContent = "— Hz";
+
+    // 無検出が1秒続いた時点で切断
+    if (
+      lastDetectedAt !== null &&
+      now - lastDetectedAt >= SILENCE_SECONDS &&
+      !gapAdded
+    ) {
+
+      history.push({
+        t: lastDetectedAt + SILENCE_SECONDS,
+        hz: null
+      });
+
+      gapAdded = true;
 
     }
 
   }
 
-  draw(now);
+  // グラフ用データは表示範囲より古いものを削除
+  const cutoff =
+    now - VISIBLE_SECONDS - SILENCE_SECONDS - 1;
 
-  raf = requestAnimationFrame(tick);
+  while (
+    history.length > 0 &&
+    history[0].t < cutoff
+  ) {
+    history.shift();
+  }
+
+}
+
+
+// グラフの描画更新
+function drawLoop() {
+
+  draw(performance.now() / 1000);
+
+  animationFrameId =
+    requestAnimationFrame(drawLoop);
 
 }
 
@@ -502,15 +593,16 @@ $("start").onclick = async () => {
 
   try {
 
-    stream = await navigator.mediaDevices.getUserMedia({
+    stream =
+      await navigator.mediaDevices.getUserMedia({
 
-      audio: {
-        echoCancellation: false,
-        noiseSuppression: false,
-        autoGainControl: false
-      }
+        audio: {
+          echoCancellation: false,
+          noiseSuppression: false,
+          autoGainControl: false
+        }
 
-    });
+      });
 
     audioCtx = new (
       window.AudioContext ||
@@ -533,13 +625,25 @@ $("start").onclick = async () => {
 
     source.connect(analyser);
 
-    $("status").textContent =
-      "測定中";
+    lastDetectedAt = null;
+    gapAdded = false;
+
+    $("status").textContent = "測定中";
 
     $("start").disabled = true;
     $("stop").disabled = false;
 
-    tick();
+    // 最初のサンプル
+    sampleAudio();
+
+    // 約50Hzでサンプリング
+    sampleTimerId = setInterval(
+      sampleAudio,
+      SAMPLE_INTERVAL_MS
+    );
+
+    // グラフ描画
+    drawLoop();
 
   } catch (e) {
 
@@ -554,11 +658,21 @@ $("start").onclick = async () => {
 // 停止
 $("stop").onclick = () => {
 
-  if (raf) {
-    cancelAnimationFrame(raf);
+  if (sampleTimerId !== null) {
+
+    clearInterval(sampleTimerId);
+
+    sampleTimerId = null;
+
   }
 
-  raf = null;
+  if (animationFrameId !== null) {
+
+    cancelAnimationFrame(animationFrameId);
+
+    animationFrameId = null;
+
+  }
 
   if (stream) {
 
@@ -566,14 +680,24 @@ $("stop").onclick = () => {
       t => t.stop()
     );
 
+    stream = null;
+
   }
 
   if (source) {
+
     source.disconnect();
+
+    source = null;
+
   }
 
   if (audioCtx) {
+
     audioCtx.close();
+
+    audioCtx = null;
+
   }
 
   analyser = null;
@@ -582,48 +706,6 @@ $("stop").onclick = () => {
   $("stop").disabled = true;
 
   $("status").textContent = "停止中";
-
-};
-
-
-// CSV保存
-$("csv").onclick = () => {
-
-  const rows = [
-    "elapsed_seconds,frequency_hz"
-  ];
-
-  if (history.length) {
-
-    const origin = history[0].t;
-
-    history.forEach(p => {
-
-      rows.push(
-        (p.t - origin).toFixed(3) +
-        "," +
-        p.hz.toFixed(2)
-      );
-
-    });
-
-  }
-
-  const blob = new Blob(
-    ["\ufeff" + rows.join("\n")],
-    {
-      type: "text/csv;charset=utf-8"
-    }
-  );
-
-  const a = document.createElement("a");
-
-  a.href = URL.createObjectURL(blob);
-  a.download = "frequency-log.csv";
-
-  a.click();
-
-  URL.revokeObjectURL(a.href);
 
 };
 
